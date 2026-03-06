@@ -1,0 +1,221 @@
+require(‘dotenv’).config();
+const TelegramBot = require(‘node-telegram-bot-api’);
+const Parser = require(‘rss-parser’);
+const cron = require(‘node-cron’);
+
+const parser = new Parser({ timeout: 10000 });
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const MIN_RATING = parseInt(process.env.MIN_RATING) || 6;
+const CHECK_INTERVAL = parseInt(process.env.CHECK_INTERVAL_MINUTES) || 30;
+
+const seenJobs = new Set();
+
+// ─── RSS FEEDS ────────────────────────────────────────────────────────────────
+const RSS_FEEDS = [
+{
+name: ‘🇷🇺 FL.ru – Web’,
+url: ‘https://www.fl.ru/rss/all.xml?category=web’,
+lang: ‘ru’,
+},
+{
+name: ‘🇷🇺 FL.ru – Design’,
+url: ‘https://www.fl.ru/rss/all.xml?category=design’,
+lang: ‘ru’,
+},
+{
+name: ‘🌍 Upwork – Website’,
+url: ‘https://www.upwork.com/ab/feed/jobs/rss?q=website+development&sort=recency&locale=en-US’,
+lang: ‘en’,
+},
+{
+name: ‘🌍 Upwork – Web Design’,
+url: ‘https://www.upwork.com/ab/feed/jobs/rss?q=web+design&sort=recency&locale=en-US’,
+lang: ‘en’,
+},
+{
+name: ‘🌍 Upwork – DACH’,
+url: ‘https://www.upwork.com/ab/feed/jobs/rss?q=webseite+erstellen&sort=recency’,
+lang: ‘de’,
+},
+];
+
+// ─── GROQ KI ANALYSE ─────────────────────────────────────────────────────────
+async function analyzeJobWithAI(title, description, source) {
+try {
+const prompt = `Du bist ein Experte für Freelance Web-Entwicklung. Analysiere diesen Job-Post:
+
+Titel: ${title}
+Quelle: ${source}
+Beschreibung: ${description?.slice(0, 800) || ‘Keine Beschreibung’}
+
+Antworte NUR in diesem JSON-Format (kein Markdown, nur reines JSON):
+{
+“bewertung”: <Zahl 1-10>,
+“zusammenfassung”: “<2-3 Sätze was gesucht wird>”,
+“budget”: “<Budget falls erwähnt, sonst Nicht angegeben>”,
+“aufwand”: “<Klein/Mittel/Groß>”,
+“empfehlung”: “<Ja/Nein + kurze Begründung>”
+}`;
+
+```
+const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  method: 'POST',
+  headers: {
+    'Authorization': `Bearer ${GROQ_API_KEY}`,
+    'Content-Type': 'application/json',
+  },
+  body: JSON.stringify({
+    model: 'llama-3.1-8b-instant',
+    max_tokens: 400,
+    messages: [{ role: 'user', content: prompt }],
+  }),
+});
+
+const data = await response.json();
+const text = data.choices?.[0]?.message?.content || '';
+const jsonMatch = text.match(/\{[\s\S]*\}/);
+if (!jsonMatch) return null;
+return JSON.parse(jsonMatch[0]);
+```
+
+} catch (err) {
+console.error(‘Groq Fehler:’, err.message);
+return null;
+}
+}
+
+// ─── NACHRICHT FORMATIEREN ────────────────────────────────────────────────────
+function escapeMarkdown(text) {
+if (!text) return ‘’;
+return String(text).replace(/[_*[]()~`>#+=|{}.!-]/g, ‘\$&’);
+}
+
+function formatMessage(item, analysis, feedName) {
+const rating = analysis.bewertung;
+const stars = ‘⭐’.repeat(Math.min(rating, 10));
+const ratingEmoji = rating >= 8 ? ‘🔥’ : rating >= 6 ? ‘✅’ : ‘⚠️’;
+
+return `${ratingEmoji} *Neuer Job gefunden\!*
+📌 *${escapeMarkdown(item.title)}*
+
+📊 *Bewertung:* ${stars} \(${rating}/10\)
+📝 *Zusammenfassung:* ${escapeMarkdown(analysis.zusammenfassung)}
+💰 *Budget:* ${escapeMarkdown(analysis.budget)}
+⏱ *Aufwand:* ${escapeMarkdown(analysis.aufwand)}
+✉️ *Empfehlung:* ${escapeMarkdown(analysis.empfehlung)}
+
+🌐 *Quelle:* ${escapeMarkdown(feedName)}
+🔗 [Job ansehen](${item.link})`;
+}
+
+// ─── FEEDS PRÜFEN ─────────────────────────────────────────────────────────────
+let isFirstRun = true;
+
+async function checkFeeds() {
+console.log(`\n[${new Date().toLocaleTimeString()}] Prüfe ${RSS_FEEDS.length} Feeds...`);
+let newJobs = 0;
+
+for (const feed of RSS_FEEDS) {
+try {
+const parsed = await parser.parseURL(feed.url);
+const items = parsed.items?.slice(0, 10) || [];
+
+```
+  for (const item of items) {
+    const jobId = item.guid || item.link || item.title;
+    if (!jobId || seenJobs.has(jobId)) continue;
+    seenJobs.add(jobId);
+    if (isFirstRun) continue;
+
+    console.log(`  → Analysiere: ${item.title?.slice(0, 60)}...`);
+
+    const analysis = await analyzeJobWithAI(
+      item.title,
+      item.contentSnippet || item.content || item.summary,
+      feed.name
+    );
+
+    if (!analysis) continue;
+    if (analysis.bewertung < MIN_RATING) {
+      console.log(`  → Übersprungen (Bewertung: ${analysis.bewertung}/${MIN_RATING})`);
+      continue;
+    }
+
+    const message = formatMessage(item, analysis, feed.name);
+    await bot.sendMessage(CHAT_ID, message, {
+      parse_mode: 'MarkdownV2',
+      disable_web_page_preview: false,
+    });
+
+    newJobs++;
+    await new Promise(r => setTimeout(r, 2000));
+  }
+} catch (err) {
+  console.error(`  ✗ Fehler bei ${feed.name}:`, err.message);
+}
+```
+
+}
+
+if (!isFirstRun) {
+console.log(`  ✓ ${newJobs} neue Jobs gesendet`);
+}
+}
+
+// ─── TELEGRAM BEFEHLE ─────────────────────────────────────────────────────────
+bot.onText(//start/, (msg) => {
+bot.sendMessage(msg.chat.id,
+`👋 *Freelance Job Bot gestartet\\!*\n\n` +
+`Ich suche alle ${CHECK_INTERVAL} Minuten nach neuen Web\\-Jobs\\.\n\n` +
+`Befehle:\n/start \\- Info\n/status \\- Status\n/check \\- Jetzt prüfen`,
+{ parse_mode: ‘MarkdownV2’ }
+);
+});
+
+bot.onText(//status/, (msg) => {
+bot.sendMessage(msg.chat.id,
+`📊 *Bot Status*\n\n` +
+`✅ Läuft\n` +
+`👁 Gesehene Jobs: ${seenJobs.size}\n` +
+`⏱ Intervall: alle ${CHECK_INTERVAL} Min\n` +
+`📡 Feeds: ${RSS_FEEDS.length}\n` +
+`⭐ Mindest\\-Bewertung: ${MIN_RATING}/10`,
+{ parse_mode: ‘MarkdownV2’ }
+);
+});
+
+bot.onText(//check/, async (msg) => {
+await bot.sendMessage(msg.chat.id, ‘🔍 Prüfe jetzt alle Feeds\.\.\.’,  { parse_mode: ‘MarkdownV2’ });
+const prev = isFirstRun;
+isFirstRun = false;
+await checkFeeds();
+isFirstRun = prev;
+await bot.sendMessage(msg.chat.id, ‘✅ Fertig\!’, { parse_mode: ‘MarkdownV2’ });
+});
+
+// ─── START ────────────────────────────────────────────────────────────────────
+async function start() {
+console.log(‘🤖 Freelance Job Bot startet…’);
+console.log(`📡 ${RSS_FEEDS.length} Feeds | ⭐ Min: ${MIN_RATING}/10 | ⏱ alle ${CHECK_INTERVAL} Min\n`);
+
+await checkFeeds();
+isFirstRun = false;
+console.log(`✅ ${seenJobs.size} bestehende Jobs markiert. Warte auf neue...\n`);
+
+try {
+await bot.sendMessage(CHAT_ID,
+`🚀 *Freelance Bot ist online\\!*\n` +
+`Überwache ${RSS_FEEDS.length} Feeds alle ${CHECK_INTERVAL} Minuten\\.`,
+{ parse_mode: ‘MarkdownV2’ }
+);
+} catch (e) {
+console.error(‘Telegram Fehler:’, e.message);
+}
+
+cron.schedule(`*/${CHECK_INTERVAL} * * * *`, checkFeeds);
+}
+
+start().catch(console.error);
